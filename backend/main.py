@@ -2661,3 +2661,274 @@ def list_operation_logs(limit: int = 30):
         "total": len(logs),
         "logs": logs,
     }
+
+# OWNER_GESTURE_CONTROL_PATCH_V2
+# 车主手势控车增强：车辆状态映射 + 上传视频识别接口
+from datetime import datetime as _owner_datetime
+from pathlib import Path as _OwnerPath
+from uuid import uuid4 as _owner_uuid4
+import shutil as _owner_shutil
+
+from fastapi import UploadFile as _OwnerUploadFile
+from fastapi import File as _OwnerFile
+from fastapi import Query as _OwnerQuery
+from fastapi import HTTPException as _OwnerHTTPException
+
+
+_OWNER_FUNCTIONS = ["home", "music", "air_conditioner", "phone", "navigation"]
+
+
+_OWNER_GESTURE_NAMES = {
+    "open_palm": "手掌张开",
+    "fist": "握拳",
+    "one": "单指",
+    "two": "双指",
+    "thumb_up": "拇指向上",
+    "thumb_down": "拇指向下",
+    "ok": "OK手势",
+    "swipe_left": "左滑",
+    "swipe_right": "右滑",
+    "wave": "挥手",
+    "circle": "单指画圈",
+    "unknown": "未知手势",
+}
+
+
+_OWNER_DEFAULT_VEHICLE_STATE = {
+    "system_awake": False,
+    "current_function": "home",
+    "volume": 50,
+    "temperature": 24,
+    "phone_status": "空闲",
+    "updated_at": "",
+}
+
+
+def _owner_now_text() -> str:
+    return _owner_datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _get_owner_vehicle_state() -> dict:
+    """
+    尽量复用 main.py 原有车辆状态变量。
+    如果旧代码里有 vehicle_state 或 VEHICLE_STATE，就直接更新它。
+    如果没有，就使用增强模块自己的默认状态。
+    """
+    global _OWNER_DEFAULT_VEHICLE_STATE
+
+    old_state = globals().get("vehicle_state")
+    if isinstance(old_state, dict):
+        return old_state
+
+    old_state_upper = globals().get("VEHICLE_STATE")
+    if isinstance(old_state_upper, dict):
+        return old_state_upper
+
+    return _OWNER_DEFAULT_VEHICLE_STATE
+
+
+def _next_function(current: str, step: int) -> str:
+    if current not in _OWNER_FUNCTIONS:
+        current = "home"
+    index = _OWNER_FUNCTIONS.index(current)
+    return _OWNER_FUNCTIONS[(index + step) % len(_OWNER_FUNCTIONS)]
+
+
+def apply_owner_gesture(gesture: str) -> dict:
+    """
+    增强版车主手势到车辆控制操作映射。
+    会覆盖旧版同名函数，旧的图片接口也会自动使用这套新映射。
+    """
+    state = _get_owner_vehicle_state()
+
+    state.setdefault("system_awake", False)
+    state.setdefault("current_function", "home")
+    state.setdefault("volume", 50)
+    state.setdefault("temperature", 24)
+    state.setdefault("phone_status", "空闲")
+
+    gesture_name = _OWNER_GESTURE_NAMES.get(gesture, "未知手势")
+    action = "no_action"
+    description = "未触发车辆控制操作"
+
+    if gesture == "open_palm":
+        state["system_awake"] = True
+        action = "wake_system"
+        description = "系统已唤醒"
+
+    elif gesture in {"fist", "ok"}:
+        action = "confirm_action"
+        description = f"已确认当前功能：{state.get('current_function', 'home')}"
+
+    elif gesture == "one":
+        state["volume"] = min(100, int(state.get("volume", 50)) + 5)
+        action = "volume_up"
+        description = f"音量增加至 {state['volume']}"
+
+    elif gesture == "two":
+        state["volume"] = max(0, int(state.get("volume", 50)) - 5)
+        action = "volume_down"
+        description = f"音量降低至 {state['volume']}"
+
+    elif gesture == "circle":
+        state["volume"] = min(100, int(state.get("volume", 50)) + 10)
+        action = "adjust_volume"
+        description = f"单指画圈调节音量，当前音量 {state['volume']}"
+
+    elif gesture == "thumb_up":
+        state["phone_status"] = "通话中"
+        state["current_function"] = "phone"
+        action = "answer_call"
+        description = "已接听电话"
+
+    elif gesture == "thumb_down":
+        state["phone_status"] = "已挂断"
+        state["current_function"] = "phone"
+        action = "hang_up_call"
+        description = "已挂断电话"
+
+    elif gesture == "swipe_left":
+        state["current_function"] = _next_function(str(state.get("current_function", "home")), -1)
+        action = "previous_function"
+        description = f"已切换到上一个功能：{state['current_function']}"
+
+    elif gesture == "swipe_right":
+        state["current_function"] = _next_function(str(state.get("current_function", "home")), 1)
+        action = "next_function"
+        description = f"已切换到下一个功能：{state['current_function']}"
+
+    elif gesture == "wave":
+        state["current_function"] = "home"
+        action = "back_home"
+        description = "已返回主页"
+
+    state["updated_at"] = _owner_now_text()
+
+    return {
+        "gesture": gesture,
+        "gesture_name": gesture_name,
+        "action": action,
+        "description": description,
+        "vehicle_state": dict(state),
+    }
+
+
+@app.post("/api/gesture/owner/video")
+def recognize_owner_gesture_from_video(
+    file: _OwnerUploadFile = _OwnerFile(...),
+    apply_control: bool = _OwnerQuery(True, description="是否将识别到的手势映射为车辆控制动作"),
+    frame_sample_interval: int = _OwnerQuery(3, ge=1, le=30, description="视频抽帧间隔"),
+    stable_threshold: int = _OwnerQuery(3, ge=1, le=20, description="误触发抑制阈值：至少多少帧确认后触发"),
+):
+    """
+    车主手势视频识别接口：
+    1. 上传 mp4 / avi / mov / mkv / webm
+    2. 后端抽帧识别手势
+    3. 静态手势做多帧投票
+    4. 动态手势做轨迹判断
+    5. 达到阈值后才触发车辆控制操作
+    """
+    from algorithm.owner_gesture_recognizer import recognize_owner_gesture_video
+
+    allowed_suffixes = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+    original_name = file.filename or ""
+    suffix = _OwnerPath(original_name).suffix.lower()
+
+    if suffix not in allowed_suffixes:
+        insert_operation_log(
+            action="owner_gesture_video_failed",
+            detail={
+                "filename": original_name,
+                "reason": "unsupported_file_type",
+            },
+        )
+        raise _OwnerHTTPException(
+            status_code=400,
+            detail="只支持 mp4、avi、mov、mkv、webm 格式视频",
+        )
+
+    saved_filename = f"owner_gesture_video_{_owner_uuid4().hex}{suffix}"
+    saved_path = UPLOAD_DIR / saved_filename
+
+    with saved_path.open("wb") as buffer:
+        _owner_shutil.copyfileobj(file.file, buffer)
+
+    image_url = f"/uploads/{saved_filename}"
+
+    output_filename = f"annotated_owner_gesture_video_{_OwnerPath(saved_filename).stem}.jpg"
+    output_path = OUTPUT_DIR / output_filename
+    output_image_url = f"/outputs/{output_filename}"
+
+    try:
+        recognition_result = recognize_owner_gesture_video(
+            input_path=saved_path,
+            output_path=output_path,
+            frame_sample_interval=frame_sample_interval,
+            stable_threshold=stable_threshold,
+        )
+    except Exception as exc:
+        insert_operation_log(
+            action="owner_gesture_video_failed",
+            detail={
+                "filename": original_name,
+                "saved_filename": saved_filename,
+                "reason": str(exc),
+            },
+        )
+        raise _OwnerHTTPException(
+            status_code=500,
+            detail=f"车主手势视频识别失败：{exc}",
+        )
+
+    control_result = {}
+    if apply_control and recognition_result.get("triggered") and recognition_result.get("gesture") != "unknown":
+        control_result = apply_owner_gesture(recognition_result["gesture"])
+        recognition_result.update({
+            "action": control_result.get("action"),
+            "description": control_result.get("description"),
+            "vehicle_state": control_result.get("vehicle_state"),
+        })
+    else:
+        recognition_result.update({
+            "action": "no_action",
+            "description": recognition_result.get("trigger_reason", "未触发车辆控制操作"),
+            "vehicle_state": dict(_get_owner_vehicle_state()),
+        })
+
+    record_id = insert_recognition_record(
+        task_type="owner_gesture",
+        input_type="video",
+        original_filename=original_name,
+        saved_filename=saved_filename,
+        image_url=image_url,
+        output_image_url=output_image_url,
+        result=recognition_result,
+    )
+
+    insert_operation_log(
+        action="owner_gesture_video_recognition",
+        detail={
+            "record_id": record_id,
+            "original_filename": original_name,
+            "saved_filename": saved_filename,
+            "gesture": recognition_result.get("gesture"),
+            "gesture_name": recognition_result.get("gesture_name"),
+            "triggered": recognition_result.get("triggered"),
+            "action": recognition_result.get("action"),
+            "frame_sample_interval": frame_sample_interval,
+            "stable_threshold": stable_threshold,
+        },
+    )
+
+    return {
+        "status": "success",
+        "record_id": record_id,
+        "alert_id": None,
+        "task_type": "owner_gesture",
+        "input_type": "video",
+        "original_filename": original_name,
+        "saved_filename": saved_filename,
+        "image_url": image_url,
+        "output_image_url": output_image_url,
+        "result": recognition_result,
+    }
