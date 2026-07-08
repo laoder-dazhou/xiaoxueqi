@@ -1,0 +1,541 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>车主手势摄像头实时识别</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      padding: 24px;
+      font-family: Arial, "Microsoft YaHei", sans-serif;
+      background: #0f172a;
+      color: #e5e7eb;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 28px;
+    }
+
+    .desc {
+      margin: 0 0 20px;
+      color: #94a3b8;
+      line-height: 1.7;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 1.2fr 1fr;
+      gap: 20px;
+      align-items: start;
+    }
+
+    .card {
+      background: #111827;
+      border: 1px solid #334155;
+      border-radius: 16px;
+      padding: 18px;
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
+    }
+
+    .video-wrap {
+      position: relative;
+      width: 100%;
+      background: #020617;
+      border-radius: 14px;
+      overflow: hidden;
+      border: 1px solid #334155;
+    }
+
+    video {
+      display: block;
+      width: 100%;
+      min-height: 360px;
+      object-fit: cover;
+      background: #020617;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: #1e293b;
+      color: #cbd5e1;
+      font-size: 13px;
+      margin: 6px 8px 6px 0;
+    }
+
+    .badge.ok {
+      background: rgba(22, 163, 74, 0.16);
+      color: #86efac;
+    }
+
+    .badge.warn {
+      background: rgba(245, 158, 11, 0.16);
+      color: #fcd34d;
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 14px;
+      align-items: center;
+    }
+
+    button {
+      border: none;
+      border-radius: 10px;
+      padding: 10px 14px;
+      background: #2563eb;
+      color: white;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    button.secondary {
+      background: #334155;
+    }
+
+    button.danger {
+      background: #dc2626;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    input {
+      width: 110px;
+      padding: 9px 10px;
+      border-radius: 10px;
+      border: 1px solid #475569;
+      background: #020617;
+      color: #e5e7eb;
+    }
+
+    .result-title {
+      color: #94a3b8;
+      font-size: 14px;
+      margin-bottom: 6px;
+    }
+
+    .main-result {
+      font-size: 28px;
+      font-weight: 800;
+      margin: 4px 0 12px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    .metric {
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 12px;
+    }
+
+    .metric .label {
+      color: #94a3b8;
+      font-size: 13px;
+      margin-bottom: 5px;
+    }
+
+    .metric .value {
+      font-size: 18px;
+      font-weight: 700;
+      word-break: break-all;
+    }
+
+    .annotated {
+      width: 100%;
+      border-radius: 12px;
+      border: 1px solid #334155;
+      background: #020617;
+      margin-top: 12px;
+      display: none;
+    }
+
+    .log {
+      height: 180px;
+      overflow: auto;
+      background: #020617;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 10px;
+      margin-top: 12px;
+      color: #cbd5e1;
+      font-family: Consolas, monospace;
+      font-size: 13px;
+      white-space: pre-wrap;
+    }
+
+    .error {
+      color: #fca5a5;
+      margin-top: 10px;
+      white-space: pre-wrap;
+    }
+
+    canvas {
+      display: none;
+    }
+
+    @media (max-width: 980px) {
+      .layout {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <h1>车主手势摄像头实时识别</h1>
+  <p class="desc">
+    浏览器调用电脑摄像头采集车主手势画面，前端定时抽帧上传到后端
+    <code>/api/gesture/owner/camera-fast-frame</code>，后端基于 MediaPipe Hands 返回手势结果、骨架标注图和车辆控制状态。
+  </p>
+
+  <div class="layout">
+    <section class="card">
+      <div class="video-wrap">
+        <video id="video" autoplay muted playsinline></video>
+        <canvas id="canvas"></canvas>
+      </div>
+
+      <div class="controls">
+        <button id="startCameraBtn">打开摄像头</button>
+        <button id="stopCameraBtn" class="secondary" disabled>关闭摄像头</button>
+        <button id="singleBtn" class="secondary" disabled>单次识别</button>
+        <button id="startLoopBtn" disabled>开始实时识别</button>
+        <button id="stopLoopBtn" class="danger" disabled>停止实时识别</button>
+
+        <span>间隔 ms：</span>
+        <input id="intervalInput" type="number" min="300" step="100" value="350" />
+      </div>
+
+      <div id="statusBadges">
+        <span class="badge warn">摄像头未启动</span>
+      </div>
+
+      <div id="errorBox" class="error"></div>
+    </section>
+
+    <section class="card">
+      <div class="result-title">当前识别结果</div>
+      <div id="mainResult" class="main-result">暂无结果</div>
+
+      <div class="grid">
+        <div class="metric">
+          <div class="label">手势代码</div>
+          <div id="gestureCode" class="value">-</div>
+        </div>
+        <div class="metric">
+          <div class="label">置信度</div>
+          <div id="confidence" class="value">-</div>
+        </div>
+        <div class="metric">
+          <div class="label">车辆动作</div>
+          <div id="action" class="value">-</div>
+        </div>
+        <div class="metric">
+          <div class="label">接口延迟</div>
+          <div id="latency" class="value">-</div>
+        </div>
+      </div>
+
+      <div class="grid">
+        <div class="metric">
+          <div class="label">系统唤醒</div>
+          <div id="systemAwake" class="value">-</div>
+        </div>
+        <div class="metric">
+          <div class="label">当前功能</div>
+          <div id="currentFunction" class="value">-</div>
+        </div>
+        <div class="metric">
+          <div class="label">音量</div>
+          <div id="volume" class="value">-</div>
+        </div>
+        <div class="metric">
+          <div class="label">电话状态</div>
+          <div id="phoneStatus" class="value">-</div>
+        </div>
+      </div>
+
+      <img id="annotatedImage" class="annotated" alt="手部关键点骨架标注图" />
+
+      <div class="log" id="logBox">等待启动...</div>
+    </section>
+  </div>
+
+  <script>
+    const API_BASE = "http://127.0.0.1:8000"
+
+    const video = document.getElementById("video")
+    const canvas = document.getElementById("canvas")
+
+    const startCameraBtn = document.getElementById("startCameraBtn")
+    const stopCameraBtn = document.getElementById("stopCameraBtn")
+    const singleBtn = document.getElementById("singleBtn")
+    const startLoopBtn = document.getElementById("startLoopBtn")
+    const stopLoopBtn = document.getElementById("stopLoopBtn")
+    const intervalInput = document.getElementById("intervalInput")
+
+    const statusBadges = document.getElementById("statusBadges")
+    const errorBox = document.getElementById("errorBox")
+    const logBox = document.getElementById("logBox")
+    const annotatedImage = document.getElementById("annotatedImage")
+
+    const mainResult = document.getElementById("mainResult")
+    const gestureCode = document.getElementById("gestureCode")
+    const confidence = document.getElementById("confidence")
+    const action = document.getElementById("action")
+    const latency = document.getElementById("latency")
+    const systemAwake = document.getElementById("systemAwake")
+    const currentFunction = document.getElementById("currentFunction")
+    const volume = document.getElementById("volume")
+    const phoneStatus = document.getElementById("phoneStatus")
+
+    let stream = null
+    let loopTimer = null
+    let isRequesting = false
+    let frameCount = 0
+    let successCount = 0
+    let totalLatency = 0
+
+    function setStatus(items) {
+      statusBadges.innerHTML = items.map(item => {
+        const cls = item.ok ? "badge ok" : "badge warn"
+        return `<span class="${cls}">${item.text}</span>`
+      }).join("")
+    }
+
+    function log(message) {
+      const now = new Date().toLocaleTimeString()
+      logBox.textContent = `[${now}] ${message}\n` + logBox.textContent
+    }
+
+    function setError(message) {
+      errorBox.textContent = message || ""
+    }
+
+    async function startCamera() {
+      setError("")
+
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            width: { ideal: 320 },
+            height: { ideal: 240 },
+            facingMode: "user"
+          },
+          audio: false
+        })
+
+        video.srcObject = stream
+
+        startCameraBtn.disabled = true
+        stopCameraBtn.disabled = false
+        singleBtn.disabled = false
+        startLoopBtn.disabled = false
+
+        setStatus([
+          { text: "摄像头已启动", ok: true },
+          { text: "实时识别未开始", ok: false }
+        ])
+
+        log("摄像头已启动。")
+
+      } catch (err) {
+        setError("摄像头启动失败：\n" + err.message)
+        log("摄像头启动失败：" + err.message)
+      }
+    }
+
+    function stopCamera() {
+      stopLoop()
+
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop())
+        stream = null
+      }
+
+      video.srcObject = null
+
+      startCameraBtn.disabled = false
+      stopCameraBtn.disabled = true
+      singleBtn.disabled = true
+      startLoopBtn.disabled = true
+      stopLoopBtn.disabled = true
+
+      setStatus([
+        { text: "摄像头未启动", ok: false }
+      ])
+
+      log("摄像头已关闭。")
+    }
+
+    function startLoop() {
+      if (!stream) {
+        setError("请先打开摄像头。")
+        return
+      }
+
+      const interval = Math.max(300, Number(intervalInput.value || 700))
+
+      stopLoop()
+      loopTimer = setInterval(captureAndRecognize, interval)
+
+      startLoopBtn.disabled = true
+      stopLoopBtn.disabled = false
+
+      setStatus([
+        { text: "摄像头已启动", ok: true },
+        { text: `实时识别中：${interval}ms/帧`, ok: true }
+      ])
+
+      log("实时识别已开始。")
+    }
+
+    function stopLoop() {
+      if (loopTimer) {
+        clearInterval(loopTimer)
+        loopTimer = null
+      }
+
+      if (stream) {
+        startLoopBtn.disabled = false
+      }
+
+      stopLoopBtn.disabled = true
+
+      if (stream) {
+        setStatus([
+          { text: "摄像头已启动", ok: true },
+          { text: "实时识别已停止", ok: false }
+        ])
+      }
+
+      log("实时识别已停止。")
+    }
+
+    function canvasToBlob(canvasElement) {
+      return new Promise(resolve => {
+        canvasElement.toBlob(blob => resolve(blob), "image/jpeg", 0.55)
+      })
+    }
+
+    async function captureAndRecognize() {
+      if (!stream || isRequesting) {
+        return
+      }
+
+      if (!video.videoWidth || !video.videoHeight) {
+        return
+      }
+
+      isRequesting = true
+      setError("")
+
+      try {
+        const maxWidth = 320
+        const scale = Math.min(1, maxWidth / video.videoWidth)
+        canvas.width = Math.round(video.videoWidth * scale)
+        canvas.height = Math.round(video.videoHeight * scale)
+
+        const ctx = canvas.getContext("2d")
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height)
+
+        const blob = await canvasToBlob(canvas)
+
+        if (!blob) {
+          throw new Error("摄像头画面转图片失败。")
+        }
+
+        const formData = new FormData()
+        formData.append("file", blob, `camera_owner_${Date.now()}.jpg`)
+
+        const startTime = performance.now()
+
+        const response = await fetch(`${API_BASE}/api/gesture/owner/camera-fast-frame`, {
+          method: "POST",
+          body: formData
+        })
+
+        const endTime = performance.now()
+        const latencyMs = Math.round(endTime - startTime)
+
+        const data = await response.json()
+
+        if (!response.ok || data.status !== "success") {
+          throw new Error(JSON.stringify(data))
+        }
+
+        frameCount += 1
+        successCount += 1
+        totalLatency += latencyMs
+
+        updateResult(data, latencyMs)
+
+      } catch (err) {
+        setError("识别失败：\n" + err.message)
+        log("识别失败：" + err.message)
+      } finally {
+        isRequesting = false
+      }
+    }
+
+    function updateResult(data, latencyMs) {
+      const result = data.result || {}
+      const state = result.vehicle_state || {}
+
+      mainResult.textContent = result.gesture_name || "未识别到有效手势"
+      gestureCode.textContent = result.gesture || "-"
+      confidence.textContent = result.confidence != null ? Number(result.confidence).toFixed(2) : "-"
+      action.textContent = result.description || result.action || "-"
+      latency.textContent = `${latencyMs} ms`
+
+      systemAwake.textContent = state.system_awake === true ? "已唤醒" : "未唤醒"
+      currentFunction.textContent = state.current_function || "-"
+      volume.textContent = state.volume != null ? state.volume : "-"
+      phoneStatus.textContent = state.phone_status || "-"
+
+      // 快速模式不刷新骨架图，避免频繁图片读写造成卡顿。
+      if (data.output_image_url) {
+        annotatedImage.src = API_BASE + data.output_image_url + `?t=${Date.now()}`
+        annotatedImage.style.display = "block"
+      }
+
+      const avgLatency = successCount > 0 ? Math.round(totalLatency / successCount) : 0
+
+      log(
+        `第 ${frameCount} 帧：${result.gesture_name || "-"} / ${result.gesture || "-"}，` +
+        `动作：${result.description || "-"}，延迟：${latencyMs}ms，平均：${avgLatency}ms`
+      )
+    }
+
+    startCameraBtn.addEventListener("click", startCamera)
+    stopCameraBtn.addEventListener("click", stopCamera)
+    singleBtn.addEventListener("click", captureAndRecognize)
+    startLoopBtn.addEventListener("click", startLoop)
+    stopLoopBtn.addEventListener("click", stopLoop)
+
+    window.addEventListener("beforeunload", () => {
+      if (stream) {
+        stream.getTracks().forEach(track => track.stop())
+      }
+    })
+  </script>
+</body>
+</html>

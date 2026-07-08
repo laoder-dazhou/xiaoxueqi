@@ -2932,3 +2932,2502 @@ def recognize_owner_gesture_from_video(
         "output_image_url": output_image_url,
         "result": recognition_result,
     }
+
+
+# FUSION_DECISION_AGENT_PATCH_V1
+# 融合决策智能体接口：跨模块综合车牌、交警手势、车主手势识别结果
+from pathlib import Path as _FusionPath
+from datetime import datetime as _FusionDateTime
+import sqlite3 as _fusion_sqlite3
+import json as _fusion_json
+
+from fastapi import Body as _FusionBody
+from fastapi import Query as _FusionQuery
+from fastapi import HTTPException as _FusionHTTPException
+
+
+def _fusion_db_path() -> _FusionPath:
+    db_path = globals().get("DB_PATH")
+    if db_path:
+        return _FusionPath(db_path)
+    return _FusionPath(__file__).resolve().parent / "data" / "app.db"
+
+
+def _fusion_connect():
+    db_path = _fusion_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = _fusion_sqlite3.connect(str(db_path))
+    conn.row_factory = _fusion_sqlite3.Row
+    return conn
+
+
+def _fusion_now_text() -> str:
+    return _FusionDateTime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _fusion_safe_json_loads(value):
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str):
+        return value
+
+    try:
+        return _fusion_json.loads(value)
+    except Exception:
+        return value
+
+
+def _fusion_table_exists(conn, table_name: str) -> bool:
+    row = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+        (table_name,),
+    ).fetchone()
+    return row is not None
+
+
+def _fusion_get_columns(conn, table_name: str) -> list[str]:
+    if not _fusion_table_exists(conn, table_name):
+        return []
+    return [row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()]
+
+
+def _fusion_init_table():
+    with _fusion_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fusion_decisions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                decision_id TEXT UNIQUE NOT NULL,
+                scenario TEXT,
+                risk_level TEXT,
+                risk_score INTEGER,
+                suggestion TEXT,
+                reason TEXT,
+                decision_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def _fusion_row_to_dict(row) -> dict:
+    if row is None:
+        return {}
+    return {key: row[key] for key in row.keys()}
+
+
+def _fusion_parse_record(row_dict: dict) -> dict:
+    if not row_dict:
+        return {}
+
+    result_value = None
+    for key in ["result", "result_json", "recognition_result"]:
+        if key in row_dict:
+            result_value = _fusion_safe_json_loads(row_dict.get(key))
+            break
+
+    if result_value is None:
+        result_value = {}
+
+    if isinstance(result_value, str):
+        result_value = {"raw": result_value}
+
+    created_at = (
+        row_dict.get("created_at")
+        or row_dict.get("created_time")
+        or row_dict.get("timestamp")
+        or ""
+    )
+
+    return {
+        "record_id": row_dict.get("id") or row_dict.get("record_id"),
+        "id": row_dict.get("id") or row_dict.get("record_id"),
+        "task_type": row_dict.get("task_type", ""),
+        "input_type": row_dict.get("input_type", ""),
+        "original_filename": row_dict.get("original_filename", ""),
+        "saved_filename": row_dict.get("saved_filename", ""),
+        "image_url": row_dict.get("image_url", ""),
+        "output_image_url": row_dict.get("output_image_url", ""),
+        "created_at": created_at,
+        "result": result_value,
+    }
+
+
+def _fusion_fetch_latest_record(task_type: str) -> dict:
+    with _fusion_connect() as conn:
+        if not _fusion_table_exists(conn, "recognition_records"):
+            return {}
+
+        columns = _fusion_get_columns(conn, "recognition_records")
+        if "task_type" not in columns:
+            return {}
+
+        order_column = "id" if "id" in columns else None
+        if order_column:
+            sql = "SELECT * FROM recognition_records WHERE task_type=? ORDER BY id DESC LIMIT 1"
+        else:
+            sql = "SELECT * FROM recognition_records WHERE task_type=? LIMIT 1"
+
+        row = conn.execute(sql, (task_type,)).fetchone()
+        return _fusion_parse_record(_fusion_row_to_dict(row))
+
+
+def _fusion_fetch_recent_alerts(limit: int = 5) -> list[dict]:
+    with _fusion_connect() as conn:
+        if not _fusion_table_exists(conn, "alert_events"):
+            return []
+
+        columns = _fusion_get_columns(conn, "alert_events")
+        order_sql = "ORDER BY id DESC" if "id" in columns else ""
+        rows = conn.execute(f"SELECT * FROM alert_events {order_sql} LIMIT ?", (limit,)).fetchall()
+
+        result = []
+        for row in rows:
+            item = _fusion_row_to_dict(row)
+            for key in ["detail", "result", "payload"]:
+                if key in item:
+                    item[key] = _fusion_safe_json_loads(item[key])
+            result.append(item)
+
+        return result
+
+
+def _fusion_build_latest_payload() -> dict:
+    return {
+        "plate": _fusion_fetch_latest_record("plate"),
+        "traffic_gesture": _fusion_fetch_latest_record("traffic_gesture"),
+        "owner_gesture": _fusion_fetch_latest_record("owner_gesture"),
+        "alerts": _fusion_fetch_recent_alerts(limit=5),
+        "performance": {},
+    }
+
+
+def _fusion_save_decision(decision: dict) -> int:
+    _fusion_init_table()
+
+    with _fusion_connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO fusion_decisions (
+                decision_id,
+                scenario,
+                risk_level,
+                risk_score,
+                suggestion,
+                reason,
+                decision_json,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                decision.get("decision_id"),
+                decision.get("scenario"),
+                decision.get("risk_level"),
+                int(decision.get("risk_score") or 0),
+                decision.get("suggestion"),
+                decision.get("reason"),
+                _fusion_json.dumps(decision, ensure_ascii=False),
+                decision.get("created_at") or _fusion_now_text(),
+            ),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+
+def _fusion_write_operation_log(action: str, detail: dict):
+    log_func = globals().get("insert_operation_log")
+    if callable(log_func):
+        try:
+            log_func(action=action, detail=detail)
+        except Exception:
+            pass
+
+
+@app.get("/api/fusion/latest")
+def get_fusion_latest():
+    """
+    获取最近一次车牌识别、交警手势识别、车主手势识别结果。
+    用于融合决策前的证据汇总。
+    """
+    latest = _fusion_build_latest_payload()
+    return {
+        "status": "success",
+        "latest": latest,
+    }
+
+
+@app.post("/api/fusion/decision")
+def create_fusion_decision(
+    payload: dict | None = _FusionBody(default=None),
+    save: bool = _FusionQuery(True, description="是否保存融合决策记录"),
+):
+    """
+    融合决策接口。
+
+    用法：
+    1. 不传 payload 或传空对象：自动读取数据库中最近的三类识别结果。
+    2. 传 payload：使用调用方提供的车牌、交警手势、车主手势结果进行融合推理。
+    """
+    from algorithm.fusion_decision_agent import FusionDecisionAgent
+
+    try:
+        if not payload:
+            payload = _fusion_build_latest_payload()
+        elif "latest" in payload and isinstance(payload["latest"], dict):
+            payload = payload["latest"]
+
+        agent = FusionDecisionAgent()
+        decision = agent.make_decision(payload)
+
+        saved_id = None
+        if save:
+            saved_id = _fusion_save_decision(decision)
+
+        _fusion_write_operation_log(
+            action="fusion_decision",
+            detail={
+                "saved_id": saved_id,
+                "decision_id": decision.get("decision_id"),
+                "scenario": decision.get("scenario"),
+                "risk_level": decision.get("risk_level"),
+                "risk_score": decision.get("risk_score"),
+            },
+        )
+
+        return {
+            "status": "success",
+            "saved_id": saved_id,
+            "decision": decision,
+        }
+
+    except Exception as exc:
+        _fusion_write_operation_log(
+            action="fusion_decision_failed",
+            detail={"reason": str(exc)},
+        )
+        raise _FusionHTTPException(status_code=500, detail=f"融合决策失败：{exc}")
+
+
+@app.get("/api/fusion/history")
+def get_fusion_history(
+    limit: int = _FusionQuery(20, ge=1, le=100),
+):
+    """
+    获取融合决策历史记录。
+    """
+    _fusion_init_table()
+
+    with _fusion_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT id, decision_id, scenario, risk_level, risk_score,
+                   suggestion, reason, decision_json, created_at
+            FROM fusion_decisions
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    items = []
+    for row in rows:
+        item = _fusion_row_to_dict(row)
+        item["decision"] = _fusion_safe_json_loads(item.get("decision_json"))
+        item.pop("decision_json", None)
+        items.append(item)
+
+    return {
+        "status": "success",
+        "total": len(items),
+        "items": items,
+    }
+
+
+# PERFORMANCE_MONITOR_PATCH_V1
+# 端到端实时性 / 延迟测试接口
+from pathlib import Path as _PerfPath
+from datetime import datetime as _PerfDateTime
+import sqlite3 as _perf_sqlite3
+import json as _perf_json
+import time as _perf_time
+import statistics as _perf_statistics
+
+from fastapi import Body as _PerfBody
+from fastapi import Query as _PerfQuery
+from fastapi import HTTPException as _PerfHTTPException
+
+
+def _perf_db_path() -> _PerfPath:
+    db_path = globals().get("DB_PATH")
+    if db_path:
+        return _PerfPath(db_path)
+    return _PerfPath(__file__).resolve().parent / "data" / "app.db"
+
+
+def _perf_connect():
+    db_path = _perf_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = _perf_sqlite3.connect(str(db_path))
+    conn.row_factory = _perf_sqlite3.Row
+    return conn
+
+
+def _perf_now_text() -> str:
+    return _PerfDateTime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _perf_init_table():
+    with _perf_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS performance_latency_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                target TEXT NOT NULL,
+                task_type TEXT,
+                input_type TEXT,
+                endpoint TEXT NOT NULL,
+                method TEXT NOT NULL,
+                status_code INTEGER,
+                success INTEGER NOT NULL,
+                latency_ms REAL NOT NULL,
+                threshold_ms INTEGER NOT NULL,
+                is_realtime INTEGER NOT NULL,
+                request_meta TEXT,
+                response_meta TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_performance_latency_target
+            ON performance_latency_records(target)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_performance_latency_created_at
+            ON performance_latency_records(created_at)
+            """
+        )
+        conn.commit()
+
+
+def _perf_row_to_dict(row) -> dict:
+    if row is None:
+        return {}
+    return {key: row[key] for key in row.keys()}
+
+
+def _perf_json_dumps(value) -> str:
+    return _perf_json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _perf_json_loads(value):
+    if not value:
+        return {}
+    try:
+        return _perf_json.loads(value)
+    except Exception:
+        return {"raw": value}
+
+
+def _perf_write_operation_log(action: str, detail: dict):
+    log_func = globals().get("insert_operation_log")
+    if callable(log_func):
+        try:
+            log_func(action=action, detail=detail)
+        except Exception:
+            pass
+
+
+def _perf_save_record(record: dict) -> int:
+    _perf_init_table()
+
+    with _perf_connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO performance_latency_records (
+                target,
+                task_type,
+                input_type,
+                endpoint,
+                method,
+                status_code,
+                success,
+                latency_ms,
+                threshold_ms,
+                is_realtime,
+                request_meta,
+                response_meta,
+                error_message,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.get("target"),
+                record.get("task_type"),
+                record.get("input_type"),
+                record.get("endpoint"),
+                record.get("method"),
+                record.get("status_code"),
+                1 if record.get("success") else 0,
+                float(record.get("latency_ms") or 0),
+                int(record.get("threshold_ms") or 1000),
+                1 if record.get("is_realtime") else 0,
+                _perf_json_dumps(record.get("request_meta") or {}),
+                _perf_json_dumps(record.get("response_meta") or {}),
+                record.get("error_message") or "",
+                record.get("created_at") or _perf_now_text(),
+            ),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+
+def _perf_project_root() -> _PerfPath:
+    return _PerfPath(__file__).resolve().parent.parent
+
+
+def _perf_demo_path(filename: str) -> _PerfPath:
+    return _perf_project_root() / "demo" / filename
+
+
+def _perf_content_type(path: _PerfPath) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if suffix == ".png":
+        return "image/png"
+    if suffix == ".mp4":
+        return "video/mp4"
+    if suffix == ".avi":
+        return "video/x-msvideo"
+    if suffix == ".mov":
+        return "video/quicktime"
+    return "application/octet-stream"
+
+
+def _perf_build_target_specs(payload: dict) -> dict:
+    """
+    测试目标配置。
+    默认使用 demo 目录里的测试文件：
+    - demo/test.png
+    - demo/hand.jpg
+    - demo/traffic.png
+    - demo/owner_gesture.mp4 如果存在则测试视频手势
+    """
+    source_id = payload.get("source_id", "live12")
+    frame_count = int(payload.get("frame_count", 20))
+    sample_interval = int(payload.get("sample_interval", 5))
+    stream_task_type = payload.get("stream_task_type", "plate")
+
+    owner_frame_interval = int(payload.get("owner_frame_sample_interval", 3))
+    owner_stable_threshold = int(payload.get("owner_stable_threshold", 3))
+
+    return {
+        "health": {
+            "target": "health",
+            "task_type": "system",
+            "input_type": "api",
+            "method": "GET",
+            "endpoint": "/api/health",
+        },
+        "plate_image": {
+            "target": "plate_image",
+            "task_type": "plate",
+            "input_type": "image",
+            "method": "POST",
+            "endpoint": "/api/plate/image",
+            "file_path": _perf_demo_path("test.png"),
+            "file_field": "file",
+        },
+        "owner_image": {
+            "target": "owner_image",
+            "task_type": "owner_gesture",
+            "input_type": "image",
+            "method": "POST",
+            "endpoint": "/api/gesture/owner/image",
+            "file_path": _perf_demo_path("hand.jpg"),
+            "file_field": "file",
+        },
+        "owner_video": {
+            "target": "owner_video",
+            "task_type": "owner_gesture",
+            "input_type": "video",
+            "method": "POST",
+            "endpoint": (
+                "/api/gesture/owner/video"
+                f"?frame_sample_interval={owner_frame_interval}"
+                f"&stable_threshold={owner_stable_threshold}"
+            ),
+            "file_path": _perf_demo_path("owner_gesture.mp4"),
+            "file_field": "file",
+        },
+        "traffic_image": {
+            "target": "traffic_image",
+            "task_type": "traffic_gesture",
+            "input_type": "image",
+            "method": "POST",
+            "endpoint": "/api/gesture/traffic/image",
+            "file_path": _perf_demo_path("traffic.png"),
+            "file_field": "file",
+        },
+        "stream_mock": {
+            "target": "stream_mock",
+            "task_type": stream_task_type,
+            "input_type": "mock_stream",
+            "method": "POST",
+            "endpoint": "/api/stream/recognize",
+            "json": {
+                "source_id": source_id,
+                "task_type": stream_task_type,
+                "frame_count": frame_count,
+                "sample_interval": sample_interval,
+                "use_mock_frame": True,
+            },
+        },
+        "stream_rtsp": {
+            "target": "stream_rtsp",
+            "task_type": stream_task_type,
+            "input_type": "rtsp_stream",
+            "method": "POST",
+            "endpoint": "/api/stream/recognize",
+            "json": {
+                "source_id": source_id,
+                "task_type": stream_task_type,
+                "frame_count": frame_count,
+                "sample_interval": sample_interval,
+                "use_mock_frame": False,
+            },
+        },
+        "fusion_decision": {
+            "target": "fusion_decision",
+            "task_type": "fusion",
+            "input_type": "latest_records",
+            "method": "POST",
+            "endpoint": "/api/fusion/decision?save=false",
+            "json": {},
+        },
+    }
+
+
+def _perf_compact_response_meta(response) -> dict:
+    meta = {
+        "status_code": response.status_code,
+        "response_size_bytes": len(response.content or b""),
+    }
+
+    try:
+        data = response.json()
+    except Exception:
+        data = None
+
+    if isinstance(data, dict):
+        meta["status"] = data.get("status")
+        meta["record_id"] = data.get("record_id")
+        meta["saved_id"] = data.get("saved_id")
+
+        if isinstance(data.get("result"), dict):
+            result = data["result"]
+            meta["gesture"] = result.get("gesture")
+            meta["gesture_name"] = result.get("gesture_name")
+            meta["plate_count"] = result.get("plate_count")
+            meta["triggered"] = result.get("triggered")
+
+        if isinstance(data.get("decision"), dict):
+            decision = data["decision"]
+            meta["scenario"] = decision.get("scenario")
+            meta["risk_level"] = decision.get("risk_level")
+            meta["risk_score"] = decision.get("risk_score")
+
+    return meta
+
+
+def _perf_run_one_target(client, spec: dict, threshold_ms: int) -> dict:
+    target = spec["target"]
+    method = spec["method"].upper()
+    endpoint = spec["endpoint"]
+
+    request_meta = {
+        "target": target,
+        "endpoint": endpoint,
+        "method": method,
+    }
+
+    file_path = spec.get("file_path")
+
+    if file_path is not None:
+        file_path = _PerfPath(file_path)
+        request_meta["file_path"] = str(file_path)
+
+        if not file_path.exists():
+            record = {
+                "target": target,
+                "task_type": spec.get("task_type"),
+                "input_type": spec.get("input_type"),
+                "endpoint": endpoint,
+                "method": method,
+                "status_code": 0,
+                "success": False,
+                "latency_ms": 0,
+                "threshold_ms": threshold_ms,
+                "is_realtime": False,
+                "request_meta": request_meta,
+                "response_meta": {"skipped": True},
+                "error_message": f"测试文件不存在：{file_path}",
+                "created_at": _perf_now_text(),
+            }
+            record["id"] = _perf_save_record(record)
+            record["skipped"] = True
+            return record
+
+    start = _perf_time.perf_counter()
+    status_code = 0
+    response_meta = {}
+    error_message = ""
+    success = False
+
+    try:
+        if method == "GET":
+            response = client.get(endpoint)
+        elif method == "POST" and file_path is not None:
+            field = spec.get("file_field", "file")
+            with file_path.open("rb") as file_obj:
+                files = {
+                    field: (
+                        file_path.name,
+                        file_obj,
+                        _perf_content_type(file_path),
+                    )
+                }
+                response = client.post(endpoint, files=files)
+        elif method == "POST":
+            response = client.post(endpoint, json=spec.get("json") or {})
+            request_meta["json"] = spec.get("json") or {}
+        else:
+            raise ValueError(f"暂不支持 method={method}")
+
+        status_code = response.status_code
+        response_meta = _perf_compact_response_meta(response)
+        success = response.status_code < 400
+
+        if not success:
+            try:
+                error_message = str(response.json())
+            except Exception:
+                error_message = response.text
+
+    except Exception as exc:
+        error_message = str(exc)
+        success = False
+
+    end = _perf_time.perf_counter()
+    latency_ms = round((end - start) * 1000, 2)
+    is_realtime = success and latency_ms <= threshold_ms
+
+    record = {
+        "target": target,
+        "task_type": spec.get("task_type"),
+        "input_type": spec.get("input_type"),
+        "endpoint": endpoint,
+        "method": method,
+        "status_code": status_code,
+        "success": success,
+        "latency_ms": latency_ms,
+        "threshold_ms": threshold_ms,
+        "is_realtime": is_realtime,
+        "request_meta": request_meta,
+        "response_meta": response_meta,
+        "error_message": error_message,
+        "created_at": _perf_now_text(),
+    }
+
+    record["id"] = _perf_save_record(record)
+    return record
+
+
+def _perf_summarize_records(records: list[dict], threshold_ms: int) -> dict:
+    latencies = [
+        float(item.get("latency_ms") or 0)
+        for item in records
+        if not item.get("skipped")
+    ]
+
+    if not latencies:
+        return {
+            "count": 0,
+            "avg_latency_ms": 0,
+            "min_latency_ms": 0,
+            "max_latency_ms": 0,
+            "p95_latency_ms": 0,
+            "pass_count": 0,
+            "fail_count": 0,
+            "pass_rate": 0,
+            "threshold_ms": threshold_ms,
+            "is_realtime": False,
+        }
+
+    sorted_values = sorted(latencies)
+
+    def percentile(values, p):
+        if len(values) == 1:
+            return round(values[0], 2)
+        rank = (p / 100) * (len(values) - 1)
+        lower = int(rank)
+        upper = min(lower + 1, len(values) - 1)
+        weight = rank - lower
+        return round(values[lower] * (1 - weight) + values[upper] * weight, 2)
+
+    pass_count = sum(1 for item in records if item.get("success") and item.get("latency_ms", 0) <= threshold_ms)
+    fail_count = len([item for item in records if not item.get("skipped")]) - pass_count
+
+    return {
+        "count": len(latencies),
+        "avg_latency_ms": round(sum(latencies) / len(latencies), 2),
+        "min_latency_ms": round(min(latencies), 2),
+        "max_latency_ms": round(max(latencies), 2),
+        "p95_latency_ms": percentile(sorted_values, 95),
+        "pass_count": pass_count,
+        "fail_count": fail_count,
+        "pass_rate": round(pass_count / len(latencies), 4),
+        "threshold_ms": threshold_ms,
+        "is_realtime": fail_count == 0,
+    }
+
+
+@app.post("/api/performance/test")
+def run_performance_test(
+    payload: dict | None = _PerfBody(default=None),
+):
+    """
+    端到端实时性测试接口。
+
+    默认测试：
+    - /api/health
+    - /api/plate/image
+    - /api/gesture/owner/image
+    - /api/gesture/traffic/image
+    - /api/stream/recognize 模拟流
+    - /api/fusion/decision
+
+    如果 demo/owner_gesture.mp4 存在，也可加入 owner_video。
+    如果需要真实 RTSP，把 targets 里加入 stream_rtsp。
+    """
+    payload = payload or {}
+
+    try:
+        from fastapi.testclient import TestClient
+    except Exception as exc:
+        raise _PerfHTTPException(
+            status_code=500,
+            detail=f"性能测试需要 fastapi.testclient/httpx 支持，请执行 pip install httpx。原始错误：{exc}",
+        )
+
+    repeat = int(payload.get("repeat", 1))
+    repeat = max(1, min(repeat, 20))
+
+    threshold_ms = int(payload.get("threshold_ms", 1000))
+    threshold_ms = max(1, threshold_ms)
+
+    default_targets = [
+        "health",
+        "plate_image",
+        "owner_image",
+        "traffic_image",
+        "stream_mock",
+        "fusion_decision",
+    ]
+
+    targets = payload.get("targets") or default_targets
+    if isinstance(targets, str):
+        targets = [targets]
+
+    target_specs = _perf_build_target_specs(payload)
+
+    unknown_targets = [target for target in targets if target not in target_specs]
+    if unknown_targets:
+        raise _PerfHTTPException(
+            status_code=400,
+            detail=f"未知性能测试目标：{unknown_targets}。可用目标：{list(target_specs.keys())}",
+        )
+
+    client = TestClient(app)
+    records = []
+
+    for round_index in range(repeat):
+        for target in targets:
+            spec = dict(target_specs[target])
+            spec["round_index"] = round_index + 1
+            record = _perf_run_one_target(client, spec, threshold_ms)
+            record["round_index"] = round_index + 1
+            records.append(record)
+
+    summary = _perf_summarize_records(records, threshold_ms)
+
+    by_target = {}
+    for target in targets:
+        target_records = [item for item in records if item.get("target") == target]
+        by_target[target] = _perf_summarize_records(target_records, threshold_ms)
+
+    _perf_write_operation_log(
+        action="performance_test",
+        detail={
+            "targets": targets,
+            "repeat": repeat,
+            "threshold_ms": threshold_ms,
+            "summary": summary,
+        },
+    )
+
+    return {
+        "status": "success",
+        "threshold_ms": threshold_ms,
+        "constraint": "端到端识别延迟建议 <= 1000ms",
+        "repeat": repeat,
+        "targets": targets,
+        "summary": summary,
+        "by_target": by_target,
+        "records": records,
+    }
+
+
+@app.get("/api/performance/latency-records")
+def get_performance_latency_records(
+    limit: int = _PerfQuery(50, ge=1, le=500),
+    target: str | None = _PerfQuery(None),
+):
+    """
+    获取最近延迟测试记录。
+    """
+    _perf_init_table()
+
+    with _perf_connect() as conn:
+        if target:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM performance_latency_records
+                WHERE target=?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (target, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM performance_latency_records
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+    items = []
+    for row in rows:
+        item = _perf_row_to_dict(row)
+        item["success"] = bool(item.get("success"))
+        item["is_realtime"] = bool(item.get("is_realtime"))
+        item["request_meta"] = _perf_json_loads(item.get("request_meta"))
+        item["response_meta"] = _perf_json_loads(item.get("response_meta"))
+        items.append(item)
+
+    return {
+        "status": "success",
+        "total": len(items),
+        "items": items,
+    }
+
+
+@app.get("/api/performance/summary")
+def get_performance_summary(
+    limit: int = _PerfQuery(200, ge=1, le=2000),
+    threshold_ms: int = _PerfQuery(1000, ge=1),
+):
+    """
+    获取性能测试汇总：
+    - 总体平均延迟
+    - P95 延迟
+    - 最大延迟
+    - 达标率
+    - 各目标接口延迟统计
+    """
+    _perf_init_table()
+
+    with _perf_connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM performance_latency_records
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+
+    records = []
+    for row in rows:
+        item = _perf_row_to_dict(row)
+        item["success"] = bool(item.get("success"))
+        item["is_realtime"] = bool(item.get("is_realtime"))
+        records.append(item)
+
+    overall = _perf_summarize_records(records, threshold_ms)
+
+    by_target = {}
+    targets = sorted({item.get("target") for item in records if item.get("target")})
+    for target_name in targets:
+        target_records = [item for item in records if item.get("target") == target_name]
+        by_target[target_name] = _perf_summarize_records(target_records, threshold_ms)
+
+    realtime_status = "pass" if overall.get("is_realtime") else "warning"
+
+    return {
+        "status": "success",
+        "constraint": "端到端识别延迟建议 <= 1000ms",
+        "threshold_ms": threshold_ms,
+        "record_count": len(records),
+        "realtime_status": realtime_status,
+        "overall": overall,
+        "by_target": by_target,
+    }
+
+
+# MULTISTREAM_CONCURRENCY_PATCH_V1
+# 多路视频流并发处理接口：支持车牌、交警手势、车主手势并行消费不同视频源
+from pathlib import Path as _MSPath
+from datetime import datetime as _MSDateTime
+import threading as _ms_threading
+import time as _ms_time
+import sqlite3 as _ms_sqlite3
+import json as _ms_json
+import uuid as _ms_uuid
+
+from fastapi import Body as _MSBody
+from fastapi import Query as _MSQuery
+from fastapi import HTTPException as _MSHTTPException
+
+
+_MS_LOCK = _ms_threading.RLock()
+_MS_STOP_EVENT = _ms_threading.Event()
+_MS_THREADS = {}
+_MS_FUSION_THREAD = None
+
+_MS_STATE = {
+    "running": False,
+    "started_at": None,
+    "stopped_at": None,
+    "enable_fusion": False,
+    "fusion_interval_seconds": 5,
+    "workers": {},
+    "latest_results": [],
+    "latest_fusion": None,
+}
+
+
+def _ms_now_text() -> str:
+    return _MSDateTime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _ms_db_path() -> _MSPath:
+    db_path = globals().get("DB_PATH")
+    if db_path:
+        return _MSPath(db_path)
+    return _MSPath(__file__).resolve().parent / "data" / "app.db"
+
+
+def _ms_connect():
+    db_path = _ms_db_path()
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = _ms_sqlite3.connect(str(db_path))
+    conn.row_factory = _ms_sqlite3.Row
+    return conn
+
+
+def _ms_init_table():
+    with _ms_connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS multistream_worker_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                worker_id TEXT NOT NULL,
+                source_id TEXT,
+                source_url TEXT,
+                task_type TEXT NOT NULL,
+                input_type TEXT,
+                endpoint TEXT,
+                cycle_index INTEGER,
+                success INTEGER NOT NULL,
+                latency_ms REAL NOT NULL,
+                result_summary TEXT,
+                error_message TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_multistream_worker_id
+            ON multistream_worker_records(worker_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_multistream_created_at
+            ON multistream_worker_records(created_at)
+            """
+        )
+        conn.commit()
+
+
+def _ms_json_dumps(value) -> str:
+    return _ms_json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _ms_json_loads(value):
+    if not value:
+        return {}
+    try:
+        return _ms_json.loads(value)
+    except Exception:
+        return {"raw": value}
+
+
+def _ms_row_to_dict(row) -> dict:
+    if row is None:
+        return {}
+    return {key: row[key] for key in row.keys()}
+
+
+def _ms_save_record(record: dict) -> int:
+    _ms_init_table()
+
+    with _ms_connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO multistream_worker_records (
+                worker_id,
+                source_id,
+                source_url,
+                task_type,
+                input_type,
+                endpoint,
+                cycle_index,
+                success,
+                latency_ms,
+                result_summary,
+                error_message,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record.get("worker_id"),
+                record.get("source_id"),
+                record.get("source_url"),
+                record.get("task_type"),
+                record.get("input_type"),
+                record.get("endpoint"),
+                int(record.get("cycle_index") or 0),
+                1 if record.get("success") else 0,
+                float(record.get("latency_ms") or 0),
+                _ms_json_dumps(record.get("result_summary") or {}),
+                record.get("error_message") or "",
+                record.get("created_at") or _ms_now_text(),
+            ),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+
+def _ms_project_root() -> _MSPath:
+    return _MSPath(__file__).resolve().parent.parent
+
+
+def _ms_demo_path(filename: str) -> _MSPath:
+    return _ms_project_root() / "demo" / filename
+
+
+def _ms_upload_dir() -> _MSPath:
+    path = _MSPath(__file__).resolve().parent / "uploads"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _ms_content_type(path: _MSPath) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if suffix == ".png":
+        return "image/png"
+    return "application/octet-stream"
+
+
+def _ms_compact_response_meta(response) -> dict:
+    meta = {
+        "status_code": response.status_code,
+        "response_size_bytes": len(response.content or b""),
+    }
+
+    try:
+        data = response.json()
+    except Exception:
+        data = None
+
+    if not isinstance(data, dict):
+        return meta
+
+    meta["status"] = data.get("status")
+    meta["record_id"] = data.get("record_id")
+    meta["saved_id"] = data.get("saved_id")
+
+    if isinstance(data.get("result"), dict):
+        result = data["result"]
+        meta["model"] = result.get("model")
+        meta["gesture"] = result.get("gesture")
+        meta["gesture_name"] = result.get("gesture_name")
+        meta["traffic_command"] = result.get("traffic_command")
+        meta["action"] = result.get("action")
+        meta["description"] = result.get("description")
+        meta["confidence"] = result.get("confidence")
+        meta["plate_count"] = result.get("plate_count")
+        meta["plates"] = result.get("plates")
+        meta["frames_read"] = result.get("frames_read")
+        meta["sampled_frames"] = result.get("sampled_frames")
+
+    if isinstance(data.get("decision"), dict):
+        decision = data["decision"]
+        meta["scenario"] = decision.get("scenario")
+        meta["risk_level"] = decision.get("risk_level")
+        meta["risk_score"] = decision.get("risk_score")
+        meta["suggestion"] = decision.get("suggestion")
+
+    return meta
+
+
+def _ms_update_worker(worker_id: str, **kwargs):
+    with _MS_LOCK:
+        worker = _MS_STATE["workers"].setdefault(worker_id, {})
+        worker.update(kwargs)
+        worker["updated_at"] = _ms_now_text()
+
+
+def _ms_append_latest_result(record: dict):
+    with _MS_LOCK:
+        _MS_STATE["latest_results"].insert(0, record)
+        _MS_STATE["latest_results"] = _MS_STATE["latest_results"][:50]
+
+
+def _ms_public_state() -> dict:
+    with _MS_LOCK:
+        data = _ms_json.loads(_ms_json_dumps(_MS_STATE))
+
+    for worker_id, thread in list(_MS_THREADS.items()):
+        if worker_id in data.get("workers", {}):
+            data["workers"][worker_id]["thread_alive"] = thread.is_alive()
+
+    if _MS_FUSION_THREAD is not None:
+        data["fusion_thread_alive"] = _MS_FUSION_THREAD.is_alive()
+    else:
+        data["fusion_thread_alive"] = False
+
+    return data
+
+
+def _ms_default_workers() -> list[dict]:
+    """
+    默认使用 mock/demo 模式，保证没有真实 RTSP 时也能演示三路并发。
+    后续接 MediaMTX 时，将 use_mock_frame 改为 false，并填 source_url 即可。
+    """
+    return [
+        {
+            "worker_id": "plate_stream_worker",
+            "source_id": "live12",
+            "task_type": "plate",
+            "use_mock_frame": True,
+            "interval_seconds": 5,
+            "frame_count": 20,
+            "sample_interval": 5,
+        },
+        {
+            "worker_id": "traffic_stream_worker",
+            "source_id": "traffic_demo",
+            "task_type": "traffic_gesture",
+            "use_mock_frame": True,
+            "demo_file": "traffic.png",
+            "interval_seconds": 5,
+        },
+        {
+            "worker_id": "owner_stream_worker",
+            "source_id": "owner_demo",
+            "task_type": "owner_gesture",
+            "use_mock_frame": True,
+            "demo_file": "hand.jpg",
+            "interval_seconds": 5,
+        },
+    ]
+
+
+def _ms_normalize_workers(payload: dict) -> list[dict]:
+    workers = payload.get("workers") or payload.get("sources") or _ms_default_workers()
+
+    if not isinstance(workers, list) or not workers:
+        raise _MSHTTPException(status_code=400, detail="workers 必须是非空数组。")
+
+    result = []
+    allowed_tasks = {"plate", "traffic_gesture", "owner_gesture"}
+
+    for index, item in enumerate(workers):
+        if not isinstance(item, dict):
+            raise _MSHTTPException(status_code=400, detail=f"第 {index + 1} 个 worker 配置不是对象。")
+
+        task_type = str(item.get("task_type") or "").strip()
+        if task_type not in allowed_tasks:
+            raise _MSHTTPException(
+                status_code=400,
+                detail=f"不支持的 task_type={task_type}，只支持 {sorted(allowed_tasks)}。",
+            )
+
+        source_id = str(item.get("source_id") or f"source_{index + 1}").strip()
+        worker_id = str(item.get("worker_id") or f"{task_type}_{source_id}_{index + 1}").strip()
+
+        config = dict(item)
+        config["worker_id"] = worker_id
+        config["source_id"] = source_id
+        config["task_type"] = task_type
+        config["interval_seconds"] = max(1, int(item.get("interval_seconds", 5)))
+        config["frame_count"] = max(1, int(item.get("frame_count", 20)))
+        config["sample_interval"] = max(1, int(item.get("sample_interval", 5)))
+        config["warmup_frames"] = max(0, int(item.get("warmup_frames", 3)))
+        config["use_mock_frame"] = bool(item.get("use_mock_frame", False))
+        config["fallback_demo"] = bool(item.get("fallback_demo", True))
+
+        result.append(config)
+
+    worker_ids = [item["worker_id"] for item in result]
+    if len(worker_ids) != len(set(worker_ids)):
+        raise _MSHTTPException(status_code=400, detail="worker_id 不能重复。")
+
+    return result
+
+
+def _ms_resolve_source_url(client, config: dict) -> str:
+    if config.get("source_url"):
+        return str(config["source_url"])
+
+    source_id = config.get("source_id")
+    if not source_id:
+        return ""
+
+    try:
+        response = client.get("/api/rtsp/sources")
+        data = response.json()
+    except Exception:
+        return ""
+
+    sources = data.get("sources") or data.get("items") or data.get("data") or []
+    if isinstance(sources, dict):
+        sources = list(sources.values())
+
+    if not isinstance(sources, list):
+        return ""
+
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        if str(source.get("id")) == str(source_id):
+            return str(source.get("url") or "")
+
+    return ""
+
+
+def _ms_capture_frame_from_rtsp(source_url: str, worker_id: str, warmup_frames: int = 3) -> _MSPath:
+    if not source_url:
+        raise RuntimeError("缺少 source_url，无法从真实视频流抽帧。")
+
+    try:
+        import cv2 as _ms_cv2
+    except Exception as exc:
+        raise RuntimeError(f"OpenCV 不可用，无法读取 RTSP：{exc}")
+
+    cap = _ms_cv2.VideoCapture(source_url)
+
+    try:
+        if not cap.isOpened():
+            raise RuntimeError(f"无法打开视频流：{source_url}")
+
+        frame = None
+        ok = False
+
+        for _ in range(max(0, warmup_frames)):
+            cap.read()
+
+        for _ in range(5):
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                break
+
+        if not ok or frame is None:
+            raise RuntimeError(f"视频流读取失败：{source_url}")
+
+        output_path = _ms_upload_dir() / f"multistream_{worker_id}_{_MSDateTime.now().strftime('%Y%m%d_%H%M%S_%f')}.jpg"
+        success = _ms_cv2.imwrite(str(output_path), frame)
+
+        if not success:
+            raise RuntimeError(f"抽帧图片保存失败：{output_path}")
+
+        return output_path
+
+    finally:
+        cap.release()
+
+
+def _ms_prepare_image_input(client, config: dict) -> tuple[_MSPath, dict]:
+    task_type = config.get("task_type")
+    use_mock = bool(config.get("use_mock_frame", False))
+
+    if task_type == "traffic_gesture":
+        demo_file = config.get("demo_file") or "traffic.png"
+    elif task_type == "owner_gesture":
+        demo_file = config.get("demo_file") or "hand.jpg"
+    else:
+        demo_file = config.get("demo_file") or "test.png"
+
+    meta = {
+        "use_mock_frame": use_mock,
+        "demo_file": demo_file,
+    }
+
+    if use_mock:
+        path = _ms_demo_path(demo_file)
+        if not path.exists():
+            raise FileNotFoundError(f"demo 测试文件不存在：{path}")
+        meta["input_path"] = str(path)
+        return path, meta
+
+    source_url = _ms_resolve_source_url(client, config)
+    meta["source_url"] = source_url
+
+    try:
+        frame_path = _ms_capture_frame_from_rtsp(
+            source_url=source_url,
+            worker_id=config.get("worker_id", "worker"),
+            warmup_frames=int(config.get("warmup_frames", 3)),
+        )
+        meta["input_path"] = str(frame_path)
+        return frame_path, meta
+    except Exception:
+        if not bool(config.get("fallback_demo", True)):
+            raise
+
+        fallback_path = _ms_demo_path(demo_file)
+        if not fallback_path.exists():
+            raise
+
+        meta["fallback_to_demo"] = True
+        meta["input_path"] = str(fallback_path)
+        return fallback_path, meta
+
+
+def _ms_run_plate_worker_once(client, config: dict, cycle_index: int, threshold_ms: int) -> dict:
+    endpoint = "/api/stream/recognize"
+
+    body = {
+        "source_id": config.get("source_id", "live12"),
+        "task_type": "plate",
+        "frame_count": int(config.get("frame_count", 20)),
+        "sample_interval": int(config.get("sample_interval", 5)),
+        "use_mock_frame": bool(config.get("use_mock_frame", True)),
+    }
+
+    start = _ms_time.perf_counter()
+    response = client.post(endpoint, json=body)
+    latency_ms = round((_ms_time.perf_counter() - start) * 1000, 2)
+
+    success = response.status_code < 400
+    response_meta = _ms_compact_response_meta(response)
+
+    error_message = ""
+    if not success:
+        try:
+            error_message = str(response.json())
+        except Exception:
+            error_message = response.text
+
+    return {
+        "worker_id": config.get("worker_id"),
+        "source_id": config.get("source_id"),
+        "source_url": config.get("source_url", ""),
+        "task_type": "plate",
+        "input_type": "mock_stream" if body["use_mock_frame"] else "rtsp_stream",
+        "endpoint": endpoint,
+        "cycle_index": cycle_index,
+        "success": success,
+        "latency_ms": latency_ms,
+        "threshold_ms": threshold_ms,
+        "is_realtime": success and latency_ms <= threshold_ms,
+        "result_summary": response_meta,
+        "error_message": error_message,
+        "created_at": _ms_now_text(),
+    }
+
+
+def _ms_run_image_stream_worker_once(client, config: dict, cycle_index: int, threshold_ms: int) -> dict:
+    task_type = config.get("task_type")
+
+    if task_type == "traffic_gesture":
+        endpoint = "/api/gesture/traffic/image"
+    elif task_type == "owner_gesture":
+        endpoint = "/api/gesture/owner/image"
+    else:
+        raise RuntimeError(f"不支持的图片流 worker task_type={task_type}")
+
+    start = _ms_time.perf_counter()
+    success = False
+    response_meta = {}
+    error_message = ""
+    status_code = 0
+    input_meta = {}
+
+    try:
+        image_path, input_meta = _ms_prepare_image_input(client, config)
+
+        with image_path.open("rb") as file_obj:
+            files = {
+                "file": (
+                    image_path.name,
+                    file_obj,
+                    _ms_content_type(image_path),
+                )
+            }
+            response = client.post(endpoint, files=files)
+
+        status_code = response.status_code
+        success = response.status_code < 400
+        response_meta = _ms_compact_response_meta(response)
+        response_meta["input_meta"] = input_meta
+
+        if not success:
+            try:
+                error_message = str(response.json())
+            except Exception:
+                error_message = response.text
+
+    except Exception as exc:
+        error_message = str(exc)
+
+    latency_ms = round((_ms_time.perf_counter() - start) * 1000, 2)
+
+    return {
+        "worker_id": config.get("worker_id"),
+        "source_id": config.get("source_id"),
+        "source_url": config.get("source_url", "") or input_meta.get("source_url", ""),
+        "task_type": task_type,
+        "input_type": "mock_frame" if bool(config.get("use_mock_frame", False)) else "rtsp_frame",
+        "endpoint": endpoint,
+        "cycle_index": cycle_index,
+        "success": success,
+        "latency_ms": latency_ms,
+        "threshold_ms": threshold_ms,
+        "is_realtime": success and latency_ms <= threshold_ms,
+        "result_summary": response_meta,
+        "error_message": error_message,
+        "created_at": _ms_now_text(),
+        "status_code": status_code,
+    }
+
+
+def _ms_run_worker_once(client, config: dict, cycle_index: int, threshold_ms: int) -> dict:
+    task_type = config.get("task_type")
+
+    if task_type == "plate":
+        return _ms_run_plate_worker_once(client, config, cycle_index, threshold_ms)
+
+    if task_type in {"traffic_gesture", "owner_gesture"}:
+        return _ms_run_image_stream_worker_once(client, config, cycle_index, threshold_ms)
+
+    raise RuntimeError(f"不支持的 task_type={task_type}")
+
+
+def _ms_worker_loop(config: dict, threshold_ms: int):
+    try:
+        from fastapi.testclient import TestClient
+    except Exception as exc:
+        _ms_update_worker(
+            config.get("worker_id", "unknown"),
+            status="failed",
+            error_message=f"缺少 TestClient/httpx2 支持：{exc}",
+        )
+        return
+
+    worker_id = config["worker_id"]
+    client = TestClient(app)
+    cycle_index = 0
+
+    _ms_update_worker(
+        worker_id,
+        worker_id=worker_id,
+        source_id=config.get("source_id"),
+        source_url=config.get("source_url", ""),
+        task_type=config.get("task_type"),
+        status="running",
+        started_at=_ms_now_text(),
+        cycle_count=0,
+        success_count=0,
+        fail_count=0,
+        last_latency_ms=None,
+        is_realtime=None,
+        config=config,
+    )
+
+    while not _MS_STOP_EVENT.is_set():
+        cycle_index += 1
+
+        _ms_update_worker(
+            worker_id,
+            status="running",
+            current_cycle=cycle_index,
+            last_started_at=_ms_now_text(),
+        )
+
+        try:
+            record = _ms_run_worker_once(client, config, cycle_index, threshold_ms)
+        except Exception as exc:
+            record = {
+                "worker_id": worker_id,
+                "source_id": config.get("source_id"),
+                "source_url": config.get("source_url", ""),
+                "task_type": config.get("task_type"),
+                "input_type": "",
+                "endpoint": "",
+                "cycle_index": cycle_index,
+                "success": False,
+                "latency_ms": 0,
+                "threshold_ms": threshold_ms,
+                "is_realtime": False,
+                "result_summary": {},
+                "error_message": str(exc),
+                "created_at": _ms_now_text(),
+            }
+
+        try:
+            record["id"] = _ms_save_record(record)
+        except Exception as exc:
+            record["db_error"] = str(exc)
+
+        _ms_append_latest_result(record)
+
+        with _MS_LOCK:
+            worker = _MS_STATE["workers"].setdefault(worker_id, {})
+            worker["cycle_count"] = int(worker.get("cycle_count") or 0) + 1
+
+            if record.get("success"):
+                worker["success_count"] = int(worker.get("success_count") or 0) + 1
+            else:
+                worker["fail_count"] = int(worker.get("fail_count") or 0) + 1
+
+            worker["status"] = "running"
+            worker["last_latency_ms"] = record.get("latency_ms")
+            worker["is_realtime"] = record.get("is_realtime")
+            worker["last_result_summary"] = record.get("result_summary")
+            worker["last_error_message"] = record.get("error_message")
+            worker["last_record_id"] = record.get("id")
+            worker["updated_at"] = _ms_now_text()
+
+        interval = max(1, int(config.get("interval_seconds", 5)))
+        _MS_STOP_EVENT.wait(interval)
+
+    _ms_update_worker(
+        worker_id,
+        status="stopped",
+        stopped_at=_ms_now_text(),
+    )
+
+
+def _ms_fusion_loop(interval_seconds: int):
+    try:
+        from fastapi.testclient import TestClient
+    except Exception as exc:
+        with _MS_LOCK:
+            _MS_STATE["latest_fusion"] = {
+                "status": "failed",
+                "error_message": f"缺少 TestClient/httpx2 支持：{exc}",
+                "created_at": _ms_now_text(),
+            }
+        return
+
+    client = TestClient(app)
+
+    while not _MS_STOP_EVENT.is_set():
+        start = _ms_time.perf_counter()
+
+        try:
+            response = client.post("/api/fusion/decision?save=true", json={})
+            latency_ms = round((_ms_time.perf_counter() - start) * 1000, 2)
+            success = response.status_code < 400
+            summary = _ms_compact_response_meta(response)
+
+            with _MS_LOCK:
+                _MS_STATE["latest_fusion"] = {
+                    "status": "success" if success else "failed",
+                    "latency_ms": latency_ms,
+                    "summary": summary,
+                    "created_at": _ms_now_text(),
+                }
+
+        except Exception as exc:
+            with _MS_LOCK:
+                _MS_STATE["latest_fusion"] = {
+                    "status": "failed",
+                    "error_message": str(exc),
+                    "created_at": _ms_now_text(),
+                }
+
+        _MS_STOP_EVENT.wait(max(1, int(interval_seconds)))
+
+
+def _ms_stop_all(join_timeout: float = 5.0) -> dict:
+    global _MS_FUSION_THREAD
+
+    _MS_STOP_EVENT.set()
+
+    for thread in list(_MS_THREADS.values()):
+        if thread.is_alive():
+            thread.join(timeout=join_timeout)
+
+    if _MS_FUSION_THREAD is not None and _MS_FUSION_THREAD.is_alive():
+        _MS_FUSION_THREAD.join(timeout=join_timeout)
+
+    with _MS_LOCK:
+        _MS_STATE["running"] = False
+        _MS_STATE["stopped_at"] = _ms_now_text()
+
+    _MS_THREADS.clear()
+    _MS_FUSION_THREAD = None
+
+    return _ms_public_state()
+
+
+
+
+# MULTISTREAM_WORKER_SAFE_FIX_V2
+# 修复多路并发 worker 线程异常不可见的问题，并在启动前预注册 worker 状态
+def _ms_worker_loop_safe(config: dict, threshold_ms: int):
+    worker_id = str(config.get("worker_id") or "unknown_worker")
+
+    try:
+        _ms_update_worker(
+            worker_id,
+            source_id=config.get("source_id"),
+            source_url=config.get("source_url", ""),
+            task_type=config.get("task_type"),
+            status="starting",
+            started_at=_ms_now_text(),
+            cycle_count=0,
+            success_count=0,
+            fail_count=0,
+            last_latency_ms=None,
+            is_realtime=None,
+            last_result_summary=None,
+            last_error_message="",
+            config=config,
+        )
+
+        _ms_worker_loop(config, threshold_ms)
+
+    except BaseException as exc:
+        _ms_update_worker(
+            worker_id,
+            source_id=config.get("source_id"),
+            source_url=config.get("source_url", ""),
+            task_type=config.get("task_type"),
+            status="failed",
+            last_error_message=repr(exc),
+            stopped_at=_ms_now_text(),
+            config=config,
+        )
+
+        try:
+            record = {
+                "worker_id": worker_id,
+                "source_id": config.get("source_id"),
+                "source_url": config.get("source_url", ""),
+                "task_type": config.get("task_type", ""),
+                "input_type": "",
+                "endpoint": "",
+                "cycle_index": 0,
+                "success": False,
+                "latency_ms": 0,
+                "threshold_ms": threshold_ms,
+                "is_realtime": False,
+                "result_summary": {"thread_error": repr(exc)},
+                "error_message": repr(exc),
+                "created_at": _ms_now_text(),
+            }
+            record["id"] = _ms_save_record(record)
+            _ms_append_latest_result(record)
+        except Exception:
+            pass
+
+
+@app.post("/api/multistream/start")
+def start_multistream_processing(payload: dict | None = _MSBody(default=None)):
+    """
+    启动多路视频流并发处理。
+
+    worker.task_type 支持：
+    - plate：调用 /api/stream/recognize
+    - traffic_gesture：从视频源抽帧后调用 /api/gesture/traffic/image
+    - owner_gesture：从视频源抽帧后调用 /api/gesture/owner/image
+    """
+    global _MS_FUSION_THREAD
+
+    payload = payload or {}
+
+    try:
+        from fastapi.testclient import TestClient  # noqa: F401
+    except Exception as exc:
+        raise _MSHTTPException(
+            status_code=500,
+            detail=f"多路并发处理需要 fastapi.testclient/httpx2 支持，请确认 httpx2 已安装在后端虚拟环境。原始错误：{exc}",
+        )
+
+    with _MS_LOCK:
+        if _MS_STATE.get("running"):
+            raise _MSHTTPException(status_code=400, detail="多路视频流并发处理已经在运行，请先调用 /api/multistream/stop。")
+
+    workers = _ms_normalize_workers(payload)
+    threshold_ms = int(payload.get("threshold_ms", 1000))
+    enable_fusion = bool(payload.get("enable_fusion", True))
+    fusion_interval_seconds = max(1, int(payload.get("fusion_interval_seconds", 5)))
+
+    _MS_STOP_EVENT.clear()
+    _MS_THREADS.clear()
+
+    with _MS_LOCK:
+        _MS_STATE["running"] = True
+        _MS_STATE["started_at"] = _ms_now_text()
+        _MS_STATE["stopped_at"] = None
+        _MS_STATE["enable_fusion"] = enable_fusion
+        _MS_STATE["fusion_interval_seconds"] = fusion_interval_seconds
+        _MS_STATE["workers"] = {}
+        _MS_STATE["latest_results"] = []
+        _MS_STATE["latest_fusion"] = None
+
+    for config in workers:
+        worker_id = config["worker_id"]
+
+        _ms_update_worker(
+            worker_id,
+            source_id=config.get("source_id"),
+            source_url=config.get("source_url", ""),
+            task_type=config.get("task_type"),
+            status="starting",
+            started_at=_ms_now_text(),
+            cycle_count=0,
+            success_count=0,
+            fail_count=0,
+            last_latency_ms=None,
+            is_realtime=None,
+            last_result_summary=None,
+            last_error_message="",
+            config=config,
+        )
+
+        thread = _ms_threading.Thread(
+            target=_ms_worker_loop_safe,
+            args=(config, threshold_ms),
+            daemon=True,
+            name=f"multistream-{worker_id}",
+        )
+
+        _MS_THREADS[worker_id] = thread
+        thread.start()
+
+    if enable_fusion:
+        _MS_FUSION_THREAD = _ms_threading.Thread(
+            target=_ms_fusion_loop,
+            args=(fusion_interval_seconds,),
+            daemon=True,
+            name="multistream-fusion",
+        )
+        _MS_FUSION_THREAD.start()
+    else:
+        _MS_FUSION_THREAD = None
+
+    return {
+        "status": "success",
+        "message": "多路视频流并发处理已启动",
+        "worker_count": len(workers),
+        "enable_fusion": enable_fusion,
+        "threshold_ms": threshold_ms,
+        "state": _ms_public_state(),
+    }
+
+
+@app.post("/api/multistream/stop")
+def stop_multistream_processing():
+    """
+    停止多路视频流并发处理。
+    """
+    state = _ms_stop_all()
+    return {
+        "status": "success",
+        "message": "多路视频流并发处理已停止",
+        "state": state,
+    }
+
+
+@app.get("/api/multistream/status")
+def get_multistream_status():
+    """
+    获取多路视频流并发处理运行状态。
+    """
+    return {
+        "status": "success",
+        "state": _ms_public_state(),
+    }
+
+
+@app.get("/api/multistream/latest")
+def get_multistream_latest_records(
+    limit: int = _MSQuery(50, ge=1, le=500),
+    worker_id: str | None = _MSQuery(None),
+):
+    """
+    获取多路并发 worker 最近运行记录。
+    """
+    _ms_init_table()
+
+    with _ms_connect() as conn:
+        if worker_id:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM multistream_worker_records
+                WHERE worker_id=?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (worker_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT *
+                FROM multistream_worker_records
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+    items = []
+    for row in rows:
+        item = _ms_row_to_dict(row)
+        item["success"] = bool(item.get("success"))
+        item["result_summary"] = _ms_json_loads(item.get("result_summary"))
+        items.append(item)
+
+    return {
+        "status": "success",
+        "total": len(items),
+        "items": items,
+    }
+
+
+# MULTISTREAM_UPDATE_WORKER_OVERRIDE_V1
+# 兼容修复：允许 _ms_update_worker(worker_id, worker_id=worker_id, ...) 这种重复传参写法
+def _ms_update_worker(*args, **kwargs):
+    """
+    多路并发 worker 状态更新函数。
+
+    修复点：
+    - 旧代码里部分调用同时传了位置参数 worker_id 和关键字参数 worker_id。
+    - 如果函数签名写成 def _ms_update_worker(worker_id, **kwargs)，会触发：
+      TypeError: got multiple values for argument 'worker_id'
+    - 这里改成 *args, **kwargs，手动解析 worker_id，避免线程启动后直接失败。
+    """
+    positional_worker_id = None
+
+    if args:
+        positional_worker_id = args[0]
+
+    keyword_worker_id = kwargs.pop("worker_id", None)
+
+    worker_id = positional_worker_id or keyword_worker_id
+
+    if worker_id is None:
+        worker_id = kwargs.get("source_id") or kwargs.get("task_type") or "unknown_worker"
+
+    worker_id = str(worker_id)
+
+    with _MS_LOCK:
+        worker = _MS_STATE["workers"].setdefault(worker_id, {})
+        worker["worker_id"] = worker_id
+
+        if keyword_worker_id is not None:
+            worker["configured_worker_id"] = str(keyword_worker_id)
+
+        worker.update(kwargs)
+        worker["updated_at"] = _ms_now_text()
+
+    return worker
+
+
+# OWNER_CAMERA_REALTIME_ENDPOINT_V1
+# 车主手势：电脑摄像头实时帧专用识别接口
+from fastapi import UploadFile as _OCUploadFile, File as _OCFile, HTTPException as _OCHTTPException
+from pathlib import Path as _OCPath
+from datetime import datetime as _OCDatetime
+import time as _oc_time
+import uuid as _oc_uuid
+import math as _oc_math
+import cv2 as _oc_cv2
+import numpy as _oc_np
+
+
+_OC_MP = None
+_OC_HANDS = None
+_OC_HISTORY = []
+_OC_HISTORY_MAX_SECONDS = 2.5
+
+_OC_VEHICLE_STATE = {
+    "system_awake": False,
+    "current_function": "home",
+    "volume": 50,
+    "temperature": 24,
+    "phone_status": "空闲",
+    "updated_at": "",
+}
+
+
+def _oc_now_text() -> str:
+    return _OCDatetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _oc_backend_dir() -> _OCPath:
+    return _OCPath(__file__).resolve().parent
+
+
+def _oc_upload_dir() -> _OCPath:
+    path = _oc_backend_dir() / "uploads"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _oc_output_dir() -> _OCPath:
+    path = _oc_backend_dir() / "outputs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _oc_get_hands():
+    global _OC_MP, _OC_HANDS
+
+    if _OC_HANDS is None:
+        import mediapipe as _mp
+        _OC_MP = _mp
+        _OC_HANDS = _mp.solutions.hands.Hands(
+            static_image_mode=False,
+            max_num_hands=1,
+            model_complexity=0,
+            min_detection_confidence=0.55,
+            min_tracking_confidence=0.50,
+        )
+
+    return _OC_HANDS
+
+
+def _oc_dist(a, b) -> float:
+    return _oc_math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2)
+
+
+def _oc_to_landmark_dicts(hand_landmarks, width: int, height: int) -> list[dict]:
+    items = []
+
+    for idx, lm in enumerate(hand_landmarks.landmark):
+        items.append({
+            "index": idx,
+            "x": round(float(lm.x), 4),
+            "y": round(float(lm.y), 4),
+            "z": round(float(lm.z), 4),
+            "pixel_x": int(lm.x * width),
+            "pixel_y": int(lm.y * height),
+        })
+
+    return items
+
+
+def _oc_finger_extended(lms, tip: int, pip: int, mcp: int, wrist: int = 0) -> bool:
+    """
+    摄像头场景下的手指伸展判定。
+    兼顾 y 方向和相对掌心距离，避免轻微弯曲造成误判。
+    """
+    tip_lm = lms[tip]
+    pip_lm = lms[pip]
+    mcp_lm = lms[mcp]
+    wrist_lm = lms[wrist]
+
+    y_extended = tip_lm.y < pip_lm.y - 0.025
+    distance_extended = _oc_dist(tip_lm, wrist_lm) > _oc_dist(pip_lm, wrist_lm) * 1.05
+
+    # 如果手指横向伸出，y 条件可能不明显，这里用 tip 到 mcp 距离兜底。
+    long_enough = _oc_dist(tip_lm, mcp_lm) > 0.11
+
+    return bool((y_extended and distance_extended) or (distance_extended and long_enough and tip_lm.y < mcp_lm.y + 0.02))
+
+
+def _oc_detect_wave(hand_center: dict, static_gesture: str) -> bool:
+    """
+    通过最近 2.5 秒手掌中心点的水平往返运动检测挥手。
+    挥手通常静态形态像 open_palm，所以必须用连续帧轨迹判断。
+    """
+    now = _oc_time.time()
+
+    _OC_HISTORY.append({
+        "t": now,
+        "x": float(hand_center["x"]),
+        "y": float(hand_center["y"]),
+        "gesture": static_gesture,
+    })
+
+    while _OC_HISTORY and now - _OC_HISTORY[0]["t"] > _OC_HISTORY_MAX_SECONDS:
+        _OC_HISTORY.pop(0)
+
+    if len(_OC_HISTORY) < 4:
+        return False
+
+    xs = [item["x"] for item in _OC_HISTORY]
+    amplitude = max(xs) - min(xs)
+
+    if amplitude < 0.16:
+        return False
+
+    signs = []
+    for i in range(1, len(xs)):
+        dx = xs[i] - xs[i - 1]
+        if abs(dx) < 0.025:
+            continue
+        signs.append(1 if dx > 0 else -1)
+
+    changes = 0
+    for i in range(1, len(signs)):
+        if signs[i] != signs[i - 1]:
+            changes += 1
+
+    open_like_count = sum(1 for item in _OC_HISTORY if item.get("gesture") in {"open_palm", "wave"})
+
+    return changes >= 1 and open_like_count >= 2
+
+
+def _oc_classify_static_hand(hand_landmarks) -> tuple[str, str, float, dict]:
+    lms = hand_landmarks.landmark
+
+    wrist = lms[0]
+    thumb_tip = lms[4]
+    thumb_ip = lms[3]
+    thumb_mcp = lms[2]
+    index_mcp = lms[5]
+    index_tip = lms[8]
+
+    index_extended = _oc_finger_extended(lms, 8, 6, 5)
+    middle_extended = _oc_finger_extended(lms, 12, 10, 9)
+    ring_extended = _oc_finger_extended(lms, 16, 14, 13)
+    pinky_extended = _oc_finger_extended(lms, 20, 18, 17)
+
+    extended_map = {
+        "index": index_extended,
+        "middle": middle_extended,
+        "ring": ring_extended,
+        "pinky": pinky_extended,
+    }
+
+    extended_count = sum(1 for value in extended_map.values() if value)
+
+    thumb_index_distance = _oc_dist(thumb_tip, index_tip)
+    thumb_to_wrist = _oc_dist(thumb_tip, wrist)
+    palm_size = max(_oc_dist(wrist, lms[9]), 1e-6)
+
+    # 收紧 thumb_up / thumb_down：
+    # 只有拇指明显竖直向上/向下，且四指没有伸出，才判定为拇指手势。
+    thumb_far_enough = thumb_to_wrist > palm_size * 0.72
+    thumb_up = (
+        extended_count == 0
+        and thumb_far_enough
+        and thumb_tip.y < wrist.y - 0.13
+        and thumb_tip.y < index_mcp.y - 0.06
+        and thumb_tip.y < thumb_ip.y - 0.025
+    )
+    thumb_down = (
+        extended_count == 0
+        and thumb_far_enough
+        and thumb_tip.y > wrist.y + 0.13
+        and thumb_tip.y > index_mcp.y + 0.06
+        and thumb_tip.y > thumb_ip.y + 0.025
+    )
+
+    ok_gesture = (
+        thumb_index_distance < 0.075
+        and middle_extended
+        and ring_extended
+        and pinky_extended
+    )
+
+    features = {
+        "index_extended": index_extended,
+        "middle_extended": middle_extended,
+        "ring_extended": ring_extended,
+        "pinky_extended": pinky_extended,
+        "non_thumb_extended_count": extended_count,
+        "thumb_index_distance": round(thumb_index_distance, 4),
+        "thumb_to_wrist": round(thumb_to_wrist, 4),
+        "palm_size": round(palm_size, 4),
+        "thumb_up_condition": bool(thumb_up),
+        "thumb_down_condition": bool(thumb_down),
+    }
+
+    if ok_gesture:
+        return "ok", "OK 手势", 0.86, features
+
+    if thumb_up:
+        return "thumb_up", "拇指向上", 0.84, features
+
+    if thumb_down:
+        return "thumb_down", "拇指向下", 0.84, features
+
+    if extended_count >= 4:
+        return "open_palm", "手掌张开", 0.88, features
+
+    # 握拳优先于 one/two 之外的模糊状态，避免误判为 thumb_up。
+    if extended_count == 0:
+        return "fist", "握拳", 0.82, features
+
+    if index_extended and not middle_extended and not ring_extended and not pinky_extended:
+        return "one", "单指", 0.80, features
+
+    if index_extended and middle_extended and not ring_extended and not pinky_extended:
+        return "two", "双指", 0.80, features
+
+    if extended_count >= 3:
+        return "open_palm", "手掌张开", 0.76, features
+
+    return "unknown", "未识别手势", 0.45, features
+
+
+def _oc_apply_vehicle_action(gesture: str) -> tuple[str, str, dict]:
+    state = _OC_VEHICLE_STATE
+    now = _oc_now_text()
+
+    action = "none"
+    description = "未触发车辆控制"
+
+    if gesture == "open_palm":
+        state["system_awake"] = True
+        state["current_function"] = "home"
+        action = "wake_system"
+        description = "系统已唤醒"
+
+    elif gesture in {"fist", "ok"}:
+        state["system_awake"] = True
+        action = "confirm"
+        description = "已确认当前操作"
+
+    elif gesture == "one":
+        state["system_awake"] = True
+        state["volume"] = min(100, int(state.get("volume", 50)) + 5)
+        state["current_function"] = "media"
+        action = "volume_up"
+        description = "音量已调高"
+
+    elif gesture == "two":
+        state["system_awake"] = True
+        state["volume"] = max(0, int(state.get("volume", 50)) - 5)
+        state["current_function"] = "media"
+        action = "volume_down"
+        description = "音量已调低"
+
+    elif gesture == "thumb_up":
+        state["system_awake"] = True
+        state["current_function"] = "phone"
+        state["phone_status"] = "通话中"
+        action = "answer_call"
+        description = "已接听电话"
+
+    elif gesture == "thumb_down":
+        state["system_awake"] = True
+        state["current_function"] = "phone"
+        state["phone_status"] = "已挂断"
+        action = "hang_up_call"
+        description = "已挂断电话"
+
+    elif gesture == "wave":
+        state["system_awake"] = True
+        state["current_function"] = "home"
+        action = "back_home"
+        description = "已返回主页"
+
+    state["updated_at"] = now
+
+    return action, description, dict(state)
+
+
+@app.post("/api/gesture/owner/camera-frame")
+def recognize_owner_gesture_camera_frame(file: _OCUploadFile = _OCFile(...)):
+    """
+    电脑摄像头实时帧识别接口。
+
+    与 /api/gesture/owner/image 的区别：
+    - 专门用于前端摄像头循环抽帧
+    - 保留连续帧轨迹，用于识别 wave 挥手
+    - 收紧 thumb_up 规则，降低握拳误判
+    """
+    start_time = _oc_time.perf_counter()
+
+    try:
+        content = file.file.read()
+
+        if not content:
+            raise _OCHTTPException(status_code=400, detail="上传图片为空。")
+
+        image_array = _oc_np.frombuffer(content, dtype=_oc_np.uint8)
+        image_bgr = _oc_cv2.imdecode(image_array, _oc_cv2.IMREAD_COLOR)
+
+        if image_bgr is None:
+            raise _OCHTTPException(status_code=400, detail="无法解析摄像头帧图片。")
+
+        height, width = image_bgr.shape[:2]
+
+        saved_name = f"owner_camera_{_oc_uuid.uuid4().hex}.jpg"
+        output_name = f"annotated_owner_camera_{_oc_uuid.uuid4().hex}.jpg"
+
+        saved_path = _oc_upload_dir() / saved_name
+        output_path = _oc_output_dir() / output_name
+
+        _oc_cv2.imwrite(str(saved_path), image_bgr)
+
+        image_rgb = _oc_cv2.cvtColor(image_bgr, _oc_cv2.COLOR_BGR2RGB)
+        hands = _oc_get_hands()
+        result = hands.process(image_rgb)
+
+        annotated = image_bgr.copy()
+
+        if not result.multi_hand_landmarks:
+            _OC_HISTORY.clear()
+            latency_ms = round((_oc_time.perf_counter() - start_time) * 1000, 2)
+            _oc_cv2.imwrite(str(output_path), annotated)
+
+            return {
+                "status": "success",
+                "record_id": None,
+                "input_type": "camera_frame",
+                "original_filename": file.filename,
+                "saved_filename": saved_name,
+                "image_url": f"/uploads/{saved_name}",
+                "output_image_url": f"/outputs/{output_name}",
+                "latency_ms": latency_ms,
+                "result": {
+                    "model": "MediaPipe Hands",
+                    "gesture": "no_hand",
+                    "gesture_name": "未检测到手部",
+                    "confidence": 0,
+                    "action": "none",
+                    "description": "未检测到手部",
+                    "vehicle_state": dict(_OC_VEHICLE_STATE),
+                    "landmarks": [],
+                    "hand_center": None,
+                    "camera_mode": True,
+                },
+            }
+
+        hand_landmarks = result.multi_hand_landmarks[0]
+
+        static_gesture, static_name, confidence, features = _oc_classify_static_hand(hand_landmarks)
+
+        xs = [lm.x for lm in hand_landmarks.landmark]
+        ys = [lm.y for lm in hand_landmarks.landmark]
+        hand_center = {
+            "x": round(sum(xs) / len(xs), 4),
+            "y": round(sum(ys) / len(ys), 4),
+        }
+
+        gesture = static_gesture
+        gesture_name = static_name
+
+        if _oc_detect_wave(hand_center, static_gesture):
+            gesture = "wave"
+            gesture_name = "挥手"
+            confidence = 0.86
+
+        action, description, vehicle_state = _oc_apply_vehicle_action(gesture)
+
+        if _OC_MP is not None:
+            _OC_MP.solutions.drawing_utils.draw_landmarks(
+                annotated,
+                hand_landmarks,
+                _OC_MP.solutions.hands.HAND_CONNECTIONS,
+            )
+
+        _oc_cv2.imwrite(str(output_path), annotated)
+
+        latency_ms = round((_oc_time.perf_counter() - start_time) * 1000, 2)
+
+        return {
+            "status": "success",
+            "record_id": None,
+            "input_type": "camera_frame",
+            "original_filename": file.filename,
+            "saved_filename": saved_name,
+            "image_url": f"/uploads/{saved_name}",
+            "output_image_url": f"/outputs/{output_name}",
+            "latency_ms": latency_ms,
+            "result": {
+                "model": "MediaPipe Hands",
+                "gesture": gesture,
+                "gesture_name": gesture_name,
+                "static_gesture": static_gesture,
+                "static_gesture_name": static_name,
+                "confidence": confidence,
+                "handedness": (
+                    result.multi_handedness[0].classification[0].label
+                    if result.multi_handedness else ""
+                ),
+                "landmarks": _oc_to_landmark_dicts(hand_landmarks, width, height),
+                "finger_features": features,
+                "hand_center": hand_center,
+                "action": action,
+                "description": description,
+                "vehicle_state": vehicle_state,
+                "camera_mode": True,
+                "dynamic_policy": "连续帧手掌中心轨迹判断 wave",
+            },
+        }
+
+    except _OCHTTPException:
+        raise
+    except Exception as exc:
+        raise _OCHTTPException(status_code=500, detail=f"摄像头手势识别失败：{exc}")
+
+
+# OWNER_CAMERA_FAST_ENDPOINT_V1
+# 车主手势：电脑摄像头快速实时帧接口
+@app.post("/api/gesture/owner/camera-fast-frame")
+def recognize_owner_gesture_camera_fast_frame(file: _OCUploadFile = _OCFile(...)):
+    """
+    电脑摄像头快速识别接口。
+
+    与 /api/gesture/owner/camera-frame 的区别：
+    - 不保存上传图片
+    - 不绘制/保存骨架图
+    - 只返回手势结果、车辆控制状态、关键点坐标和延迟
+    - 适合前端高频实时识别
+    """
+    start_time = _oc_time.perf_counter()
+
+    try:
+        content = file.file.read()
+
+        if not content:
+            raise _OCHTTPException(status_code=400, detail="上传图片为空。")
+
+        image_array = _oc_np.frombuffer(content, dtype=_oc_np.uint8)
+        image_bgr = _oc_cv2.imdecode(image_array, _oc_cv2.IMREAD_COLOR)
+
+        if image_bgr is None:
+            raise _OCHTTPException(status_code=400, detail="无法解析摄像头帧图片。")
+
+        height, width = image_bgr.shape[:2]
+
+        image_rgb = _oc_cv2.cvtColor(image_bgr, _oc_cv2.COLOR_BGR2RGB)
+        hands = _oc_get_hands()
+        result = hands.process(image_rgb)
+
+        latency_ms = round((_oc_time.perf_counter() - start_time) * 1000, 2)
+
+        if not result.multi_hand_landmarks:
+            _OC_HISTORY.clear()
+
+            return {
+                "status": "success",
+                "record_id": None,
+                "input_type": "camera_fast_frame",
+                "output_image_url": "",
+                "latency_ms": latency_ms,
+                "result": {
+                    "model": "MediaPipe Hands",
+                    "gesture": "no_hand",
+                    "gesture_name": "未检测到手部",
+                    "confidence": 0,
+                    "action": "none",
+                    "description": "未检测到手部",
+                    "vehicle_state": dict(_OC_VEHICLE_STATE),
+                    "landmarks": [],
+                    "hand_center": None,
+                    "camera_mode": True,
+                    "fast_mode": True,
+                },
+            }
+
+        hand_landmarks = result.multi_hand_landmarks[0]
+
+        static_gesture, static_name, confidence, features = _oc_classify_static_hand(hand_landmarks)
+
+        xs = [lm.x for lm in hand_landmarks.landmark]
+        ys = [lm.y for lm in hand_landmarks.landmark]
+
+        hand_center = {
+            "x": round(sum(xs) / len(xs), 4),
+            "y": round(sum(ys) / len(ys), 4),
+        }
+
+        gesture = static_gesture
+        gesture_name = static_name
+
+        if _oc_detect_wave(hand_center, static_gesture):
+            gesture = "wave"
+            gesture_name = "挥手"
+            confidence = 0.86
+
+        action, description, vehicle_state = _oc_apply_vehicle_action(gesture)
+
+        return {
+            "status": "success",
+            "record_id": None,
+            "input_type": "camera_fast_frame",
+            "output_image_url": "",
+            "latency_ms": latency_ms,
+            "result": {
+                "model": "MediaPipe Hands",
+                "gesture": gesture,
+                "gesture_name": gesture_name,
+                "static_gesture": static_gesture,
+                "static_gesture_name": static_name,
+                "confidence": confidence,
+                "handedness": (
+                    result.multi_handedness[0].classification[0].label
+                    if result.multi_handedness else ""
+                ),
+                "landmarks": _oc_to_landmark_dicts(hand_landmarks, width, height),
+                "finger_features": features,
+                "hand_center": hand_center,
+                "action": action,
+                "description": description,
+                "vehicle_state": vehicle_state,
+                "camera_mode": True,
+                "fast_mode": True,
+                "dynamic_policy": "快速模式：连续帧手掌中心轨迹判断 wave，不返回骨架图",
+            },
+        }
+
+    except _OCHTTPException:
+        raise
+    except Exception as exc:
+        raise _OCHTTPException(status_code=500, detail=f"摄像头快速手势识别失败：{exc}")
