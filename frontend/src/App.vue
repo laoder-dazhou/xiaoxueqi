@@ -1,5 +1,7 @@
 
 <script setup>
+import OwnerCameraPanel from './components/OwnerCameraPanel.vue'
+
 import { computed, onMounted, reactive, ref } from 'vue'
 
 const API_BASE = 'http://127.0.0.1:8000'
@@ -493,6 +495,7 @@ onMounted(() => {
           <div>
             <p class="eyebrow">Owner Gesture Control</p>
             <h2>车主手势控车</h2>
+      <OwnerCameraPanel />
             <p>
               支持车主手势图片与视频上传识别。后端基于 MediaPipe Hands 提取 21 个手部关键点，
               并通过连续帧确认与动态轨迹判断降低误触发。
